@@ -1,0 +1,199 @@
+---
+title: "Proyecto_Leo"
+author: "LeoC426"
+date: "26/2/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Proyecto SRP220466 "Identification of miRNA-mRNA regulatory network for Human Atrial Aging [mRNA]"
+```{r}
+library(recount3)
+human_projects <- available_projects()
+proj_info <- subset(
+    human_projects,
+    project == "SRP220466" & project_type == "data_sources"
+)
+rse_gene_SRP220466 <- create_rse(proj_info)
+```
+
+```{r}
+## Convirtamos las cuentas por nucleotido a cuentas por lectura
+## usando compute_read_counts().
+assay(rse_gene_SRP220466, "counts") <- compute_read_counts(rse_gene_SRP220466)
+```
+```{r}
+# Expandimos los atributos SRA
+rse_gene_SRP220466 <- expand_sra_attributes(rse_gene_SRP220466)
+
+colData(rse_gene_SRP220466)[
+    ,
+    grepl("^sra_attribute", colnames(colData(rse_gene_SRP220466)))
+]
+```
+
+
+```{r}
+# Pasamos a formatos manejables para nuestro trabajos estadistico 
+rse_gene_SRP220466$sra_attribute.age <- as.numeric(rse_gene_SRP220466$sra_attribute.age)
+rse_gene_SRP220466$sra_attribute.gender <- as.factor(rse_gene_SRP220466$sra_attribute.gender)
+rse_gene_SRP220466$sra_attribute.source_name <- as.factor(rse_gene_SRP220466$sra_attribute.source_name)
+rse_gene_SRP220466$sra_attribute.surgical_procedure <- as.factor(rse_gene_SRP220466$sra_attribute.surgical_procedure)
+```
+
+```{r}
+## Resumen de las variables de interés
+summary(as.data.frame(colData(rse_gene_SRP220466)[
+    ,
+    grepl("^sra_attribute.[age|gender|source_name|surgical_procedure]", colnames(colData(rse_gene_SRP220466)))
+]))
+```
+
+```{r}
+#Separamos nuestras edades por mayores y menores de 50 años  y encontramos diferencias 
+rse_gene_SRP220466$menor50 <- factor(ifelse(rse_gene_SRP220466$sra_attribute.age < 50, "menor50", "mayor50"))
+table(rse_gene_SRP220466$menor50)
+```
+
+```{r}
+# Metemos el número de fragmentos, incluidos los mapeadores múltiples, asignados por featureCountsven un gen
+# entre el número total de entrada de fragmentos de mapeo exclusivo a featureCounts
+rse_gene_SRP220466$assigned_gene_prop <- rse_gene_SRP220466$recount_qc.gene_fc_count_all.assigned / rse_gene_SRP220466$recount_qc.gene_fc_count_all.total
+```
+```{r}
+with(colData(rse_gene_SRP220466), tapply(assigned_gene_prop, menor50, summary))
+```
+```{r}
+## Guardemos nuestro objeto entero por si luego cambiamos de opinión
+rse_gene_SRP220466_unfiltered <- rse_gene_SRP220466
+# Nota: no cambiamos soy genial :3 
+## Eliminemos a muestras malas
+hist(rse_gene_SRP220466$assigned_gene_prop)
+```
+
+```{r}
+table(rse_gene_SRP220466$assigned_gene_prop < 0.66)
+# Aqui vemos cuantos genes cumplen con esta condiciones y si es false es que es menor de 0.66
+```
+
+```{r}
+# Eliminamos los menores a 0.66
+rse_gene_SRP220466 <- rse_gene_SRP220466[, rse_gene_SRP220466$assigned_gene_prop > 0.66]
+
+```
+```{r}
+gene_means <- rowMeans(assay(rse_gene_SRP220466, "counts"))
+summary(gene_means)
+```
+```{r}
+## Eliminamos genes
+rse_gene_SRP220466 <- rse_gene_SRP220466[gene_means > 0.1, ]
+## Dimensiones finales
+dim(rse_gene_SRP220466)
+## Porcentaje de genes que retuvimos
+round(nrow(rse_gene_SRP220466) / nrow(rse_gene_SRP220466_unfiltered) * 100, 2)
+```
+
+```{r}
+# Normalizamos los datos 
+library("edgeR")
+dge <- DGEList(
+    counts = assay(rse_gene_SRP220466, "counts"),
+    genes = rowData(rse_gene_SRP220466)
+)
+dge <- calcNormFactors(dge)
+```
+```{r}
+# Exploramos los datos que consideramos para este proyecto 
+library("ggplot2")
+ggplot(as.data.frame(colData(rse_gene_SRP220466)), aes(y = assigned_gene_prop, x = menor50)) +
+    geom_boxplot() +
+    theme_bw(base_size = 20) +
+    ylab("Assigned Gene Prop") +
+    xlab("Age Group")
+```
+Aqui podemos encontrar como los menores se encuentran en rangos mas bajos del promedio que se hizo en assigned_gene_prop 
+```{r}
+# Continuamos haciendo otro modelo para seguir analizando nuestros datos 
+mod <- model.matrix(~ menor50 + sra_attribute.age + sra_attribute.gender + assigned_gene_prop,
+    data = colData(rse_gene_SRP220466)
+)
+colnames(mod)
+```
+
+```{r}
+# Ya teniendo el modelo estadístico, podemos usar limma para realizar el análisis de expresión diferencial
+library("limma")
+vGene <- voom(dge, mod, plot = TRUE)
+```
+Aqui podemos ver como nuestro modelo tiene una buena respresentacion con el modelo de Voom, es relativamente buena aunque algunos datos siguen excediendo limites posiblemente se necesite limpiar un poco mas.
+```{r}
+# Con eBayes se espera calcular Estadísticas Empíricas De Bayes Para Expresión Diferencial
+# y con lmFit se ajustara el modelo lineal para cada gen dada una serie de matrices 
+eb_results <- eBayes(lmFit(vGene))
+# Y extraemos una tabla de los genes mejor clasificados de un ajuste de modelo lineal
+de_results <- topTable(
+    eb_results,
+    coef = 2,
+    number = nrow(rse_gene_SRP220466),
+    sort.by = "none"
+)
+dim(de_results)
+```
+```{r}
+# Visualizamos los resultados 
+head(de_results)
+```
+```{r}
+## Visualicemos los resultados estadísticos
+plotMA(eb_results, coef = 2)
+```
+Un MAplot representa la expresión logarítmica promedio frente a la relación promedio (o cambio de veces) entre dos condiciones, en este caso los valores no se alejan tanto del cero lo que nos da una buena señal.
+```{r}
+volcanoplot(eb_results, coef = 2, highlight = 3, names = de_results$gene_name)
+```
+Podemos ver como hay mas de 2 o mas genes importantes en este estudio gracias al -log(p-value) y como nos los marca  
+```{r}
+## Extraer valores de los genes de interés
+exprs_heatmap <- vGene$E[rank(de_results$adj.P.Val) <= 60, ]
+
+## Creemos una tabla con información de las muestras
+## y con nombres de columnas más amigables
+df <- as.data.frame(colData(rse_gene_SRP220466)[, c("menor50", "sra_attribute.age", "sra_attribute.gender")])
+colnames(df) <- c("AgeGroup", "age", "gender")
+
+## Hagamos un heatmap
+library("pheatmap")
+pheatmap(
+    exprs_heatmap,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_rownames = FALSE,
+    show_colnames = FALSE,
+    annotation_col = df
+)
+```
+Con estos datos podemos ver que en los grupos menores de 50 es donde se encuentran los valores mas pequeños 
+```{r}
+library("RColorBrewer")
+
+## Conviertiendo los grupos de edad a colores
+col.group <- df$AgeGroup
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+col.group <- as.character(col.group)
+
+## MDS por grupos de edad
+plotMDS(vGene$E, labels = df$AgeGroup, col = col.group)
+```
+```{r}
+## Conviertiendo los valores de Gender a colores
+col.gender <- df$gender
+levels(col.gender) <- brewer.pal(nlevels(col.gender), "Dark2")
+col.gender <- as.character(col.gender)
+
+## MDS por sexo
+plotMDS(vGene$E, labels = df$gender, col = col.gender)
+```
+En las dos graficas anteriores podemos ver como se agrupan estadisticamente los hombres y mujeres en este estudio de envejecimeinto auricular, tambien vemos si son mayores de 50 o menores, para saber en que sexo se da más esta condicion y en que edad comienza 
